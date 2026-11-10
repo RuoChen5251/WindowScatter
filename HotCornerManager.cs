@@ -83,7 +83,8 @@ namespace WindowScatter
 
                         isOnCooldown = true;
                         cornerEnteredTime = null;
-                        isInCorner = false;
+                        // One activation per entry. Staying in the corner must
+                        // not toggle the overview off when cooldown expires.
                         onHotCornerTriggered?.Invoke();
 
                         var cooldownTimer = new DispatcherTimer();

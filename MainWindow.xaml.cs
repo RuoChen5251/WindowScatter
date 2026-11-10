@@ -23,10 +23,8 @@ namespace WindowScatter
         private bool useDesktopCapture = true;
 
         private List<WindowThumb> windowThumbs = new List<WindowThumb>();
-        private List<WindowLayout>? cachedLayouts;
-        private List<IntPtr>? lastWindowHandles;
+        private readonly ScatterInteraction scatterInteraction = new ScatterInteraction();
         private IntPtr selectedWindowHandle = IntPtr.Zero;
-        private Random rng = new Random();
 
         private bool isScatterActive = false;
         private bool isTransitioning = false;
@@ -107,15 +105,7 @@ namespace WindowScatter
             {
                 await Dispatcher.InvokeAsync(async () =>
                 {
-                    // Already open: dwelling in the corner must not re-scatter
-                    // (not even the bring-to-front fallback - just stay quiet).
-                    if (this.Visibility == Visibility.Visible)
-                        return;
-
-                    if (CanActivateScatter())
-                    {
-                        await StartScatterAsync();
-                    }
+                    await ToggleScatterAsync();
                 });
             });
             hotCornerManager.Start();
@@ -135,6 +125,9 @@ namespace WindowScatter
             animationManager.OnScatterComplete = () =>
             {
                 try { thumbnailManager.SyncClickBordersToThumbs(currentDpiScale); } catch { }
+                // Let FinishAnimation complete its keep-alive setup before
+                // starting a return animation requested while opening.
+                Dispatcher.BeginInvoke(new Action(TryDismissScatter));
             };
 
             if (!useDesktopCapture)
@@ -224,26 +217,31 @@ namespace WindowScatter
                 {
                     UpdateModifierKeyState(vkCode, true);
 
-                    if (vkCode == configuredHotkey.VirtualKeyCode && CheckModifiersMatch())
+                    if (vkCode == configuredHotkey.VirtualKeyCode)
                     {
-                        suppressStartMenu = true;
-                        startMenuSuppressionStart = DateTime.Now;
-
-                        this.Dispatcher.BeginInvoke(new Action(async () =>
+                        bool modifiersMatch = CheckModifiersMatch();
+                        bool toggle = scatterInteraction.ActivationKeyDown(modifiersMatch);
+                        if (modifiersMatch)
                         {
-                            if (CanActivateScatter())
+                            suppressStartMenu = true;
+                            startMenuSuppressionStart = DateTime.Now;
+                            if (toggle)
                             {
-                                await StartScatterAsync();
-                                await System.Threading.Tasks.Task.Delay(250);
-                                ReleaseModifierKeys();
+                                this.Dispatcher.BeginInvoke(new Action(async () =>
+                                {
+                                    await ToggleScatterAsync();
+                                    await System.Threading.Tasks.Task.Delay(250);
+                                    ReleaseModifierKeys();
+                                }));
                             }
-                        }));
-
-                        return (IntPtr)1;
+                            return (IntPtr)1;
+                        }
                     }
                 }
                 else if (wParam == (IntPtr)WM_KEYUP || wParam == (IntPtr)WM_SYSKEYUP)
                 {
+                    if (vkCode == configuredHotkey.VirtualKeyCode)
+                        scatterInteraction.ActivationKeyUp();
                     if ((vkCode == VK_LWIN || vkCode == VK_RWIN) && suppressStartMenu)
                     {
                         if ((DateTime.Now - startMenuSuppressionStart).TotalMilliseconds < 500)
@@ -314,11 +312,20 @@ namespace WindowScatter
             bool isEsc = e.Key == Key.Escape ||
                          (e.Key == Key.System && e.SystemKey == Key.Escape);
 
-            if (isEsc && !animationManager.IsAnimating && !isTransitioning)
+            if (isEsc)
             {
                 e.Handled = true;
-                CleanupAndClose();
+                RequestDismissScatter();
             }
+        }
+
+        private void ScatterCanvas_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            // Thumbnail borders handle their own clicks. Only bare canvas hits
+            // dismiss the overview, never a click meant to select a window.
+            if (!ReferenceEquals(e.OriginalSource, ScatterCanvas)) return;
+            e.Handled = true;
+            RequestDismissScatter();
         }
 
         private bool HandleScatterNavigationKey(Key key)
@@ -403,6 +410,29 @@ namespace WindowScatter
                        !isTransitioning &&
                        this.Visibility != Visibility.Visible;
             }
+        }
+
+        private async System.Threading.Tasks.Task ToggleScatterAsync()
+        {
+            if (animationManager == null || isTransitioning) return;
+            if (isScatterActive || this.Visibility == Visibility.Visible)
+                RequestDismissScatter();
+            else if (CanActivateScatter())
+                await StartScatterAsync();
+        }
+
+        private void RequestDismissScatter()
+        {
+            if (isTransitioning || (!isScatterActive && this.Visibility != Visibility.Visible)) return;
+            scatterInteraction.RequestDismiss();
+            TryDismissScatter();
+        }
+
+        private void TryDismissScatter()
+        {
+            bool busy = isScatterActive || animationManager.IsAnimating || isTransitioning;
+            if (scatterInteraction.TakeDismissRequest(busy) && this.Visibility == Visibility.Visible)
+                CleanupAndClose();
         }
 
         private void ForceWindowToTop(IntPtr hwnd)
@@ -501,18 +531,11 @@ namespace WindowScatter
                 if (wasIdle) Cleanup();
                 else animationManager.StopAllAnimations();
 
-                var currentHandles = windowsOnTargetMonitor.Select(w => w.Handle).ToList();
-                bool windowStateChanged = HasWindowStateChanged(currentHandles);
-
-                List<WindowLayout> layouts;
-                if (!windowStateChanged && cachedLayouts != null)
-                    layouts = ReuseCachedLayouts(windowsOnTargetMonitor);
-                else
-                {
-                    layouts = CalculateNewLayouts(windowsOnTargetMonitor, targetMonitorBounds.Width, targetMonitorBounds.Height);
-                    cachedLayouts = new List<WindowLayout>(layouts);
-                    lastWindowHandles = currentHandles;
-                }
+                // Deterministic geometry makes caching unnecessary. Recalculate
+                // from current rectangles and monitor bounds so moves/resizes do
+                // not silently reuse stale thumbnail sizes or positions.
+                var layouts = new WindowLayoutCalculator().CalculateLayouts(
+                    windowsOnTargetMonitor, targetMonitorBounds.Width, targetMonitorBounds.Height);
 
                 // Create thumbnails while off-screen to avoid visible setup flicker.
                 SetWindowPos(ourHwnd, HWND_TOPMOST, -30000, 0,
@@ -565,36 +588,8 @@ namespace WindowScatter
             finally
             {
                 lock (transitionLock) { isScatterActive = false; }
+                TryDismissScatter();
             }
-        }
-
-        private bool HasWindowStateChanged(List<IntPtr> currentHandles)
-        {
-            return lastWindowHandles == null ||
-                   lastWindowHandles.Count != currentHandles.Count ||
-                   !lastWindowHandles.SequenceEqual(currentHandles);
-        }
-
-        private List<WindowLayout> ReuseCachedLayouts(List<WindowInfo> windows)
-        {
-            var layouts = new List<WindowLayout>(cachedLayouts!);
-            var windowsByHandle = windows.ToDictionary(w => w.Handle);
-
-            foreach (var layout in layouts)
-            {
-                if (windowsByHandle.ContainsKey(layout.Window.Handle))
-                {
-                    layout.Window = windowsByHandle[layout.Window.Handle];
-                }
-            }
-
-            return layouts;
-        }
-
-        private List<WindowLayout> CalculateNewLayouts(List<WindowInfo> windows, double screenW, double screenH)
-        {
-            var calculator = new WindowLayoutCalculator(rng);
-            return calculator.CalculateLayouts(windows, screenW, screenH);
         }
 
         #endregion
@@ -776,8 +771,7 @@ namespace WindowScatter
                     {
                         await Dispatcher.InvokeAsync(async () =>
                         {
-                            if (CanActivateScatter())
-                                await StartScatterAsync();
+                            await ToggleScatterAsync();
                         });
                     });
 
@@ -806,8 +800,7 @@ namespace WindowScatter
                 {
                     await Dispatcher.InvokeAsync(async () =>
                     {
-                        if (CanActivateScatter())
-                            await StartScatterAsync();
+                        await ToggleScatterAsync();
                     });
                 };
             }
@@ -960,6 +953,7 @@ namespace WindowScatter
 
         private void FullCleanup()
         {
+            scatterInteraction.ClearDismissRequest();
             RestoreWorkingSet();
             if (timerPeriodActive)
             {
@@ -970,8 +964,6 @@ namespace WindowScatter
             animationManager?.StopAllAnimations();
             thumbnailManager?.CleanupAllThumbnails();
 
-            cachedLayouts = null;
-            lastWindowHandles = null;
             selectedWindowHandle = IntPtr.Zero;
 
             desktopCaptureManager?.Cleanup();

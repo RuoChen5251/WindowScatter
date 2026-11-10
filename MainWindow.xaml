@@ -32,6 +32,7 @@
         <!-- Hit-test rectangles for DWM thumbnails. -->
         <Canvas x:Name="ScatterCanvas"
                 Background="Transparent"
+                MouseLeftButtonDown="ScatterCanvas_MouseLeftButtonDown"
                 Panel.ZIndex="3"
                 Width="{Binding RelativeSource={RelativeSource AncestorType=Window}, Path=ActualWidth}"
                  Height="{Binding RelativeSource={RelativeSource AncestorType=Window}, Path=ActualHeight}"/>

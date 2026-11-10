@@ -12,7 +12,7 @@ A Windows utility that brings macOS Exposé-style window management to your desk
 
 - **Live DWM thumbnails**: windows are rendered in real-time using the Desktop Window Manager API, not static screenshots
 - **Scatter animation**: windows animate from their original positions to the overview and back
-- **Smart layout**: windows are arranged to avoid overlap while preserving spatial context (each thumbnail appears near where its real window actually is)
+- **稳定的空间布局**：所有预览统一缩放，保留窗口之间的大小比例和各自宽高比，优先靠近原位置；允许少量交叠，不再随机散开
 - **Keyboard navigation**: arrow keys, Tab, and Enter to navigate and select without touching the mouse (still needs some work)
 - **Hot corners**: move your cursor to a screen corner to trigger the overview automatically
 - **Configurable hotkey**: default is `Win+W`, changeable in `settings.json`
@@ -51,7 +51,46 @@ The app runs silently in the background with no visible window. Once running:
 
 1. Press **Win+W** (default) to trigger the scatter view
 2. Click a thumbnail to switch to that window
-3. Press **Escape** to dismiss without switching
+3. 按 **Escape**、点击空白处或再次按激活快捷键，退出总览而不切换窗口
+
+### 此 fork 的布局与退出行为
+
+- 大窗口的预览仍然比小窗口大；同一次总览内只使用一个缩放系数，不单独放大、压扁或缩小某个预览。
+- 以窗口在当前显示器上的原始中心为参考，边缘或跨屏窗口会被限制在总览可见范围内。位置调整优先选择离原中心较近的候选，不承诺拥挤时所有左右、上下关系都不变。
+- 任意两个预览的交叠面积最多为较小预览面积的 **5%**，阈值集中定义在 `WindowLayoutCalculator.MaxOverlapFraction`，暂不提供配置项。这个限制针对预览矩形，不包括标题和高亮装饰。
+- 候选位置仍然放不下时，统一缩小所有窗口后重新尝试。极端情况下若贪心搜索仍失败，则在可容纳全部窗口的统一比例下按原始横向顺序排列作为安全兜底；不是正常情况下的固定网格模式。
+- 相同的窗口句柄、原始矩形和屏幕尺寸得到相同布局，改变窗口枚举顺序不会让布局随机变化。每次打开都使用最新几何数据，不复用只按句柄判断的旧缓存。
+- 快捷键、托盘菜单/双击和热角重新进入都可切换总览的开关状态。热角每次进入只触发一次，持续停留不会自动关闭；需先离开再进入，并受原有冷却时间限制。
+- 打开动画期间点击空白、按 Escape 或再次激活，会在打开完成后退出；收起期间的重复请求会被忽略。长按激活键不会反复开关。
+- 点击预览仍会激活对应窗口；点击空白退出不会主动激活另一个窗口。
+
+### 验证与测试
+
+独立测试项目使用 **.NET 10 SDK**，可在 Linux/WSL 或 Windows 上运行；主程序的目标框架仍是 .NET 8 Windows，没有升级主程序运行时要求。
+
+```bash
+dotnet test tests/WindowScatter.LayoutTests/WindowScatter.LayoutTests.csproj
+
+# 在 Linux/WSL 中只交叉构建主程序，不运行 Windows 界面
+dotnet build WindowScatter.csproj -c Release -p:EnableWindowsTargeting=true
+```
+
+测试直接链接实际布局算法、输入策略及数据模型的源码，仅为未被调用的 WPF 控件类型提供占位定义，不调用 Win32/DWM。覆盖统一比例、少量交叠、边界、枚举顺序稳定性、移动/缩放更新、20 个窗口堆叠、100 组固定种子的随机桌面，以及快捷键去重和延迟退出。它们不替代 Windows UI 集成测试。
+
+Windows 实机验收清单（需手工运行，交叉构建无法验证）：
+
+1. 摆放不同大小的窗口，连续呼出多次，核对大小比例、原始方位和稳定性；移动/调整窗口大小后再呼出，布局应随之更新。
+2. 分别用快捷键再次按下、空白点击、Escape、托盘和热角重新进入退出；确认没有切换到未点击的窗口。
+3. 长按快捷键、快速重复激活、打开动画中请求退出，确认不会反复开关或卡在总览。鼠标停留在热角超过冷却时间，不应自动关闭。
+4. 点击预览、键盘选择后按 Enter，确认仍能切换；退出动画完成后确认再次呼出正常。
+5. 在 Windows 10/11、多显示器（含负坐标）及 100%/150%/200% DPI 下核对预览、点击区域和空白区域是否一致。
+
+如需从 WSL 生成 Windows x64 的独立运行目录，可执行下列命令；生成后把整个目录复制到 Windows 运行，而不是在 Linux 下运行 WPF 程序：
+
+```bash
+dotnet publish WindowScatter.csproj -c Release -r win-x64 --self-contained true \
+  -p:EnableWindowsTargeting=true -o artifacts/win-x64
+```
 
 ---
 
@@ -128,7 +167,7 @@ WindowScatter/
 
 1. A low-level keyboard hook intercepts the configured hotkey system-wide
 2. On trigger, `WindowEnumerator` lists all visible windows on the active monitor
-3. `WindowLayoutCalculator` computes scatter positions, scaling windows down to ~15–50% of original size and distributing them across the screen without overlap, biased toward preserving each window's original screen region
+3. `WindowLayoutCalculator` 使用最高 50% 的统一缩放比例计算位置，优先保留原始中心和相对大小，允许最多 5% 的两两交叠；拥挤时整体继续缩小，没有 15% 的硬下限
 4. `DesktopCaptureManager` captures a live DWM thumbnail of the desktop as the blurred background
 5. `ThumbnailManager` registers a DWM thumbnail for each window and places transparent click-capture borders over them on a WPF Canvas
 6. `WindowAnimationManager` runs an animation loop interpolating each thumbnail from its real position to its scatter position
